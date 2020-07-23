@@ -1,24 +1,16 @@
-import { call, put, take, takeEvery } from 'redux-saga/effects'
+import future from 'fp-future'
+import { call, put, take } from 'redux-saga/effects'
 
 import { DEBUG_MESSAGES } from 'config'
 import { initializeEngine } from 'unity-interface/dcl'
 
-import { waitingForRenderer, UNEXPECTED_ERROR } from 'shared/loading/types'
+import { waitingForRenderer } from 'shared/loading/types'
 import { createLogger } from 'shared/logger'
 import { ReportFatalError } from 'shared/loading/ReportFatalError'
 import { StoreContainer } from 'shared/store/rootTypes'
 
 import { UnityLoaderType, UnityGame } from './types'
-import {
-  INITIALIZE_RENDERER,
-  InitializeRenderer,
-  engineStarted,
-  ENGINE_STARTED,
-  messageFromEngine,
-  MessageFromEngineAction,
-  MESSAGE_FROM_ENGINE,
-  rendererEnabled
-} from './actions'
+import { INITIALIZE_RENDERER, InitializeRenderer, engineStarted, messageFromEngine, rendererEnabled } from './actions'
 
 const queryString = require('query-string')
 
@@ -26,22 +18,25 @@ declare const globalThis: StoreContainer
 declare const UnityLoader: UnityLoaderType
 declare const global: any
 
-const DEBUG = false
 const logger = createLogger('renderer: ')
 
+/**
+ * InstancedJS is the local instance of Decentraland
+ */
+let _instancedJS: ReturnType<typeof initializeEngine> | null = null
+
+/**
+ * UnityGame instance (Either Unity WebGL or Or Unity editor via WebSocket)
+ */
 let _gameInstance: UnityGame | null = null
 
+const engineInitialized = future()
+
 export function* rendererSaga() {
-  let _instancedJS: ReturnType<typeof initializeEngine> | null = null
-  yield takeEvery(MESSAGE_FROM_ENGINE, (action: MessageFromEngineAction) =>
-    handleMessageFromEngine(_instancedJS, action)
-  )
-
   const action: InitializeRenderer = yield take(INITIALIZE_RENDERER)
-  const _gameInstance = yield call(initializeRenderer, action)
-
-  yield take(ENGINE_STARTED)
-  _instancedJS = yield call(wrapEngineInstance, _gameInstance)
+  yield call(initializeRenderer, action)
+  yield engineInitialized
+  yield put(rendererEnabled(_instancedJS!))
 }
 
 function* initializeRenderer(action: InitializeRenderer) {
@@ -59,57 +54,46 @@ function* initializeRenderer(action: InitializeRenderer) {
 
   yield put(waitingForRenderer())
 
+  yield engineInitialized
+
+  yield put(engineStarted())
+
   return _gameInstance
-}
-
-function* wrapEngineInstance(_gameInstance: UnityGame) {
-  if (!_gameInstance) {
-    throw new Error('There is no UnityGame')
-  }
-
-  enableLogin()
-
-  const _instancedJS: ReturnType<typeof initializeEngine> = initializeEngine(_gameInstance)
-
-  _instancedJS
-    .then(($) => {
-      // Expose the "kernel" interface as a global object to allow easier inspection
-      global['browserInterface'] = $
-      globalThis.globalStore.dispatch(rendererEnabled(_instancedJS))
-    })
-    .catch((error) => {
-      logger.error(error)
-      ReportFatalError(UNEXPECTED_ERROR)
-    })
-
-  return _instancedJS
-}
-
-function* handleMessageFromEngine(
-  _instancedJS: ReturnType<typeof initializeEngine> | null,
-  action: MessageFromEngineAction
-) {
-  const { type, jsonEncodedMessage } = action.payload
-  DEBUG && logger.info(`handleMessageFromEngine`, action.payload)
-  if (_instancedJS) {
-    if (type === 'PerformanceReport') {
-      _instancedJS.then(($) => $.onMessage(type, jsonEncodedMessage)).catch((e) => logger.error(e.message))
-      return
-    }
-    _instancedJS.then(($) => $.onMessage(type, JSON.parse(jsonEncodedMessage))).catch((e) => logger.error(e.message))
-  } else {
-    logger.error('Message received without initializing engine', type, jsonEncodedMessage)
-  }
 }
 
 namespace DCL {
   // This function get's called by the engine
   export function EngineStarted() {
-    globalThis.globalStore.dispatch(engineStarted())
+    if (!_gameInstance) {
+      throw new Error('There is no UnityGame')
+    }
+
+    enableLogin()
+
+    _instancedJS = initializeEngine(_gameInstance)
+
+    _instancedJS
+      .then(($) => {
+        // Expose the "kernel" interface as a global object to allow easier inspection
+        global['browserInterface'] = $
+        engineInitialized.resolve($)
+      })
+      .catch((error) => {
+        engineInitialized.reject(error)
+        ReportFatalError('Unexpected fatal error')
+      })
   }
 
   export function MessageFromEngine(type: string, jsonEncodedMessage: string) {
-    globalThis.globalStore.dispatch(messageFromEngine(type, jsonEncodedMessage))
+    if (_instancedJS) {
+      if (type === 'PerformanceReport') {
+        _instancedJS.then(($) => $.onMessage(type, jsonEncodedMessage)).catch((e) => logger.error(e.message))
+        return
+      }
+      _instancedJS.then(($) => $.onMessage(type, JSON.parse(jsonEncodedMessage))).catch((e) => logger.error(e.message))
+    } else {
+      logger.error('Message received without initializing engine', type, jsonEncodedMessage)
+    }
   }
 }
 
